@@ -1,0 +1,17 @@
+FROM golang:1.21-alpine
+
+# Set working directory
+WORKDIR /app
+
+# Install build dependencies and Air for hot-reloading
+RUN apk add --no-cache git && \
+    go install github.com/cosmtrek/air@latest
+
+# Copy source code
+COPY . .
+
+# Expose port
+EXPOSE 8080
+
+# Run the application with hot reloading
+CMD ["air", "-c", ".air.toml"] 

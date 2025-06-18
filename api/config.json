@@ -1,0 +1,12 @@
+{
+    "server": {
+        "port": "8080",
+        "host": "localhost",
+        "log_file": "api.log"
+    },
+    "ai": {
+        "endpoint": "https://auto-comment.gokulakrishnanr812-492.workers.dev/",
+        "default_model": "claude-3-haiku-20240307",
+        "timeout": 30
+    }
+}

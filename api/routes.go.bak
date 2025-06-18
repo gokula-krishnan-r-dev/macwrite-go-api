@@ -1,0 +1,314 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+)
+
+// AIRequest represents the incoming request structure
+type AIRequest struct {
+	Text   string `json:"text"`
+	Prompt string `json:"prompt"`
+	Stream bool   `json:"stream,omitempty"` // Flag to indicate streaming response
+}
+
+// CloudflareAIRequest represents the request structure specifically formatted for Cloudflare
+type CloudflareAIRequest struct {
+	Content      string `json:"content"`                // Using content instead of text for Cloudflare compatibility
+	SystemPrompt string `json:"system_prompt,omitempty"`
+	Model        string `json:"model,omitempty"`
+	Stream       bool   `json:"stream,omitempty"` // Streaming flag for Cloudflare
+}
+
+// ErrorResponse represents a standardized error response
+type ErrorResponse struct {
+	Error string `json:"error"`
+}
+
+// StreamEvent represents a single SSE event 
+type StreamEvent struct {
+	ID    string `json:"id,omitempty"`
+	Event string `json:"event,omitempty"`
+	Data  string `json:"data"`
+}
+
+// registerAIRoutes registers all AI-related routes
+func registerAIRoutes(router *gin.RouterGroup) {
+	router.POST("/ai/generate", generateAIResponse)
+	router.POST("/ai/stream", streamAIResponse)   // New streaming endpoint
+	router.GET("/ai/debug", debugCloudflareConnection)
+}
+
+// debugCloudflareConnection tests the connection to the Cloudflare service
+func debugCloudflareConnection(c *gin.Context) {
+	requestID, _ := c.Get("RequestID")
+	rid := requestID.(string)
+	
+	log.Printf("[%s] Testing connection to Cloudflare endpoint: %s", rid, cfg.AI.Endpoint)
+	
+	// Make a simple GET request to check connection
+	client := &http.Client{Timeout: 10 * time.Second}
+	req, err := http.NewRequest("GET", cfg.AI.Endpoint, nil)
+	
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Error: fmt.Sprintf("Failed to create test request: %v", err),
+		})
+		return
+	}
+	
+	// Add basic headers
+	req.Header.Set("User-Agent", "GoCustomAIProxy/1.0")
+	
+	// Execute the request
+	resp, err := client.Do(req)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Error: fmt.Sprintf("Connection test failed: %v", err),
+		})
+		return
+	}
+	defer resp.Body.Close()
+	
+	// Read response
+	respBody, _ := io.ReadAll(resp.Body)
+	
+	// Return debug information
+	c.JSON(http.StatusOK, gin.H{
+		"endpoint":       cfg.AI.Endpoint,
+		"status_code":    resp.StatusCode,
+		"response_body":  string(respBody),
+		"headers":        resp.Header,
+		"content_length": resp.ContentLength,
+	})
+}
+
+// generateAIResponse handles the AI request and forwards it to the actual AI service
+func generateAIResponse(c *gin.Context) {
+	requestID, _ := c.Get("RequestID")
+	rid := requestID.(string)
+	
+	// Log the start of request processing
+	log.Printf("[%s] Processing AI request from %s", rid, c.ClientIP())
+	
+	// Read request body
+	rawBody, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		log.Printf("[%s] ERROR: Failed to read request body: %v", rid, err)
+		c.JSON(http.StatusBadRequest, ErrorResponse{
+			Error: "Failed to read request body",
+		})
+		return
+	}
+	
+	// Parse the request
+	var request AIRequest
+	if err := json.Unmarshal(rawBody, &request); err != nil {
+		log.Printf("[%s] ERROR: Invalid request format: %v", rid, err)
+		c.JSON(http.StatusBadRequest, ErrorResponse{
+			Error: "Invalid request format",
+		})
+		return
+	}
+	
+	// Validate text field
+	if request.Text == "" {
+		log.Printf("[%s] ERROR: Text field is required", rid)
+		c.JSON(http.StatusBadRequest, ErrorResponse{
+			Error: "Text field is required",
+		})
+		return
+	}
+	
+	// Check if streaming is requested
+	if request.Stream {
+		// Redirect to streaming handler
+		streamAIResponse(c)
+		return
+	}
+	
+	// Log the received request
+	requestJSON, _ := json.Marshal(request)
+	log.Printf("[%s] Request body: %s", rid, string(requestJSON))
+	
+	// Initialize Cloudflare-specific request - modify field names to match Cloudflare expectations
+	cloudflareRequest := CloudflareAIRequest{
+		Content:      request.Text,
+		SystemPrompt: request.Prompt,
+		Model:        cfg.AI.DefaultModel,
+		Stream:       false,
+	}
+
+	// Create a client with timeout and retries
+	client := &http.Client{
+		Timeout: cfg.AI.Timeout,
+	}
+
+	// Properly encode the request body as JSON
+	jsonData, err := json.Marshal(cloudflareRequest)
+	if err != nil {
+		log.Printf("[%s] ERROR: Failed to marshal JSON request: %v", rid, err)
+		c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Error: "Failed to prepare request",
+		})
+		return
+	}
+	
+	// Log the formatted Cloudflare request
+	log.Printf("[%s] Cloudflare request: %s", rid, string(jsonData))
+	
+	requestBody := bytes.NewBuffer(jsonData)
+	
+	// Log outgoing request to AI service
+	log.Printf("[%s] Sending request to AI service: %s", rid, cfg.AI.Endpoint)
+	
+	// Create the request with additional headers for Cloudflare
+	req, err := http.NewRequest("POST", cfg.AI.Endpoint, requestBody)
+	if err != nil {
+		log.Printf("[%s] ERROR: Failed to create request to AI service: %v", rid, err)
+		c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Error: "Failed to create request to AI service",
+		})
+		return
+	}
+
+	// Set headers
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Origin", "https://ai-core-proxy.example.com") // Fix CORS issues
+	req.Header.Set("Referer", "https://ai-core-proxy.example.com")
+	
+	// Execute the request with retry logic
+	var resp *http.Response
+	maxRetries := 3
+	retryDelay := 1 * time.Second
+	
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		log.Printf("[%s] Executing request to AI service (attempt %d/%d)...", rid, attempt, maxRetries)
+		resp, err = client.Do(req)
+		
+		if err == nil && (resp.StatusCode < 500 || resp.StatusCode >= 600) {
+			// Success or non-retriable error
+			break
+		}
+		
+		if err != nil {
+			log.Printf("[%s] Attempt %d failed: %v", rid, attempt, err)
+		} else {
+			log.Printf("[%s] Attempt %d failed with status code: %d", rid, attempt, resp.StatusCode)
+			resp.Body.Close()
+		}
+		
+		if attempt < maxRetries {
+			time.Sleep(retryDelay)
+			retryDelay *= 2 // Exponential backoff
+		}
+	}
+	
+	// Check if all retries failed
+	if err != nil {
+		log.Printf("[%s] ERROR: Failed to communicate with AI service after %d attempts: %v", rid, maxRetries, err)
+		c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Error: "Failed to communicate with AI service",
+		})
+		return
+	}
+	
+	defer resp.Body.Close()
+	
+	// Log response status and headers
+	log.Printf("[%s] AI service response status: %d", rid, resp.StatusCode)
+	log.Printf("[%s] AI service response headers: %v", rid, resp.Header)
+
+	// Read the response
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("[%s] ERROR: Failed to read AI service response: %v", rid, err)
+		c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Error: "Failed to read AI service response",
+		})
+		return
+	}
+	
+	// Log the raw response for debugging
+	log.Printf("[%s] Raw response: %s", rid, string(respBody))
+	
+	// Check for Cloudflare errors
+	if resp.StatusCode >= 400 {
+		// Try to parse error response
+		var cloudflareError map[string]interface{}
+		if err := json.Unmarshal(respBody, &cloudflareError); err == nil {
+			log.Printf("[%s] Cloudflare error details: %v", rid, cloudflareError)
+		}
+		
+		// If we get a Cloudflare error page (HTML), return a clearer error message
+		if bytes.Contains(respBody, []byte("<html>")) || bytes.Contains(respBody, []byte("<!DOCTYPE html>")) {
+			log.Printf("[%s] Received HTML error from Cloudflare", rid)
+			
+			// Extract error details from HTML if possible
+			htmlError := string(respBody)
+			errorMessage := "AI service is currently unavailable. Please try again later."
+			
+			// Try to extract a more specific error message from the HTML
+			if strings.Contains(htmlError, "400 Bad Request") {
+				errorMessage = "The AI service rejected the request format. Please check your input."
+			} else if strings.Contains(htmlError, "403 Forbidden") {
+				errorMessage = "Access to the AI service is forbidden. Please check your credentials."
+			} else if strings.Contains(htmlError, "429 Too Many Requests") {
+				errorMessage = "The AI service is rate limiting requests. Please try again later."
+			} else if strings.Contains(htmlError, "500 Internal Server Error") || strings.Contains(htmlError, "Worker threw exception") {
+				errorMessage = "The AI service encountered an internal error. Please try again later."
+			} else if strings.Contains(htmlError, "502 Bad Gateway") {
+				errorMessage = "The AI service is temporarily unavailable. Please try again later."
+			} else if strings.Contains(htmlError, "504 Gateway Timeout") {
+				errorMessage = "The AI service timed out. Please try with a simpler request."
+			}
+			
+			c.JSON(http.StatusInternalServerError, ErrorResponse{
+				Error: errorMessage,
+			})
+			return
+		}
+	}
+	
+	// Try to check for valid JSON response
+	if !json.Valid(respBody) && resp.StatusCode == http.StatusOK {
+		log.Printf("[%s] WARNING: Received non-JSON response with OK status", rid)
+		c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Error: "AI service returned an invalid response format",
+		})
+		return
+	}
+
+	// Handle different response status codes
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusCreated, http.StatusAccepted:
+		// Success - pass through the response
+		c.Data(resp.StatusCode, "application/json", respBody)
+	case http.StatusBadRequest:
+		// Bad request - check if the response is valid JSON
+		if json.Valid(respBody) {
+			c.Data(resp.StatusCode, "application/json", respBody)
+		} else {
+			c.JSON(http.StatusBadRequest, ErrorResponse{
+				Error: "The AI service rejected the request format. Please check your input.",
+			})
+		}
+	default:
+		// Server error or unexpected status
+		c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Error: "AI service returned an unexpected response",
+		})
+	}
+	
+	log.Printf("[%s] Successfully completed request", rid)
+} 
